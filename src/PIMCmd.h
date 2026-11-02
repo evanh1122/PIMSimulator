@@ -14,6 +14,7 @@
 #define __PIM_CMD_HPP__
 
 #include <bitset>
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <string>
