@@ -12,8 +12,10 @@
 
 #include "PIMRank.h"
 
+#include <algorithm>
 #include <bitset>
 #include <iostream>
+#include <stdexcept>
 
 #include "AddressMapping.h"
 #include "PIMCmd.h"
@@ -32,6 +34,10 @@ PIMRank::PIMRank(ostream& simLog, Configuration& configuration)
       numRepeatToBeDone_(-1),
       crfExit_(false),
       config(configuration),
+      macBudgets_(configuration.NUM_PIM_BLOCKS, 0),
+      remainingMacs_(configuration.NUM_PIM_BLOCKS, 0),
+      executedMacs_(configuration.NUM_PIM_BLOCKS, 0),
+      skippedMacs_(configuration.NUM_PIM_BLOCKS, 0),
       pimBlocks(getConfigParam(UINT, "NUM_PIM_BLOCKS"),
                 PIMBlock(PIMConfiguration::getPIMPrecision()))
 {
@@ -64,6 +70,38 @@ int PIMRank::getRankId() const
 }
 
 void PIMRank::update() {}
+
+void PIMRank::resetMacAccounting()
+{
+    remainingMacs_ = macBudgets_;
+    fill(executedMacs_.begin(), executedMacs_.end(), 0);
+    fill(skippedMacs_.begin(), skippedMacs_.end(), 0);
+}
+
+void PIMRank::configureCompletionMask(const vector<unsigned>& macCounts)
+{
+    if (macCounts.size() != pimBlocks.size())
+        throw invalid_argument("Completion masking requires one MAC budget per PIM block");
+
+    macBudgets_ = macCounts;
+    completionMaskEnabled_ = true;
+    resetMacAccounting();
+}
+
+void PIMRank::disableCompletionMask()
+{
+    completionMaskEnabled_ = false;
+}
+
+uint64_t PIMRank::getExecutedMacs(unsigned pb) const
+{
+    return executedMacs_.at(pb);
+}
+
+uint64_t PIMRank::getSkippedMacs(unsigned pb) const
+{
+    return skippedMacs_.at(pb);
+}
 
 void PIMRank::controlPIM(BusPacket* packet)
 {
@@ -104,6 +142,7 @@ void PIMRank::controlPIM(BusPacket* packet)
         pimPC_ = 0;
         lastJumpIdx_ = numJumpToBeTaken_ = lastRepeatIdx_ = numRepeatToBeDone_ = -1;
         crfExit_ = false;
+        resetMacAccounting();
         PRINTC(RED, OUTLOG_CH_RA("HAB_PIM"));
     }
     else
@@ -392,9 +431,22 @@ void PIMRank::doPIM(BusPacket* packet)
                     lastRepeatIdx_ = -1;
             }
 
+            const bool isMac = cCmd.type_ == PIMCmdType::MAC;
             for (int pimblock_id = 0; pimblock_id < config.NUM_PIM_BLOCKS; pimblock_id++)
             {
+                if (isMac && completionMaskEnabled_ && remainingMacs_[pimblock_id] == 0)
+                {
+                    ++skippedMacs_[pimblock_id];
+                    continue;
+                }
+
                 doPIMBlock(packet, cCmd, pimblock_id);
+
+                if (isMac)
+                {
+                    ++executedMacs_[pimblock_id];
+                    if (completionMaskEnabled_) --remainingMacs_[pimblock_id];
+                }
 
                 if (DEBUG_PIM_BLOCK && pimblock_id == 0)
                 {

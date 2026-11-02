@@ -13,6 +13,7 @@
 #ifndef _PIMRANK_H_
 #define _PIMRANK_H_
 
+#include <cstdint>
 #include <vector>
 
 #include "AddressMapping.h"
@@ -66,6 +67,13 @@ class PIMRank : public SimulatorObject
     int pimPC_, lastJumpIdx_, numJumpToBeTaken_, lastRepeatIdx_, numRepeatToBeDone_;
     bool pimOpMode_, toggleEvenBank_, toggleOddBank_, toggleRa13h_, crfExit_;
 
+    // Budgets count a prefix of vector MAC executions, including internal zeros.
+    // Completion gates only MACs; shared control and result stores still execute.
+    bool completionMaskEnabled_ = false;
+    vector<unsigned> macBudgets_, remainingMacs_;
+    vector<uint64_t> executedMacs_, skippedMacs_;
+    void resetMacAccounting();
+
   public:
     PIMRank(ostream& simLog, Configuration& configuration);
     ~PIMRank() {}
@@ -86,6 +94,12 @@ class PIMRank : public SimulatorObject
     void writeOpd(int pb, BurstType& bst, PIMOpdType type, BusPacket* packet, int idx, bool is_auto,
                   bool is_mac);
     bool isToggleCond(BusPacket* packet);
+
+    // Functional configuration API. Descriptor transfer timing is not modeled.
+    void configureCompletionMask(const vector<unsigned>& macCounts);
+    void disableCompletionMask();
+    uint64_t getExecutedMacs(unsigned pb) const;
+    uint64_t getSkippedMacs(unsigned pb) const;
 
     union crf_t
     {
