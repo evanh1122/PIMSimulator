@@ -88,7 +88,7 @@ generation are unchanged.
 
 ## Finding budgets without moving data
 
-`discoverMacBudgets()` in `CompletionMaskingTestCases.cpp` scans matrix chunks in
+`discoverMacBudgets()` in the shared `PIMControlTestFixture.h` scans matrix chunks in
 compute-trigger order. For each block it returns one plus the index of the last
 chunk containing any nonzero FP16 weight, or zero for an all-zero assignment.
 It quantizes test weights to FP16 just as the preload path does, and does not

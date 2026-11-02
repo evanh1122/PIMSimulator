@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <bitset>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 
 #include "AddressMapping.h"
@@ -27,12 +28,11 @@ PIMRank::PIMRank(ostream& simLog, Configuration& configuration)
     : chanId(-1),
       rankId(-1),
       dramsimLog(simLog),
-      pimPC_(0),
-      lastJumpIdx_(-1),
-      numJumpToBeTaken_(-1),
-      lastRepeatIdx_(-1),
-      numRepeatToBeDone_(-1),
-      crfExit_(false),
+      blockStates_(configuration.NUM_PIM_BLOCKS),
+      pimOpMode_(false),
+      toggleEvenBank_(true),
+      toggleOddBank_(true),
+      toggleRa13h_(false),
       config(configuration),
       macBudgets_(configuration.NUM_PIM_BLOCKS, 0),
       remainingMacs_(configuration.NUM_PIM_BLOCKS, 0),
@@ -103,6 +103,35 @@ uint64_t PIMRank::getSkippedMacs(unsigned pb) const
     return skippedMacs_.at(pb);
 }
 
+void PIMRank::enableSelectiveProgress()
+{
+    if (!selectiveProgressEnabled_)
+    {
+        // Preserve the current shared position if enabled after execution began.
+        fill(blockStates_.begin(), blockStates_.end(), sharedState_);
+        selectiveProgressEnabled_ = true;
+    }
+}
+
+unsigned PIMRank::getBlockPC(unsigned pb) const
+{
+    const ExecutionState& state = blockStates_.at(pb);
+    return selectiveProgressEnabled_ ? state.pc : sharedState_.pc;
+}
+
+bool PIMRank::isBlockExited(unsigned pb) const
+{
+    const ExecutionState& state = blockStates_.at(pb);
+    return selectiveProgressEnabled_ ? state.exited : sharedState_.exited;
+}
+
+bool PIMRank::allBlocksExited() const
+{
+    if (!selectiveProgressEnabled_) return sharedState_.exited;
+    return all_of(blockStates_.begin(), blockStates_.end(),
+                  [](const ExecutionState& state) { return state.exited; });
+}
+
 void PIMRank::controlPIM(BusPacket* packet)
 {
     uint8_t grf_a_zeroize = packet->data->u8Data_[20];
@@ -139,9 +168,8 @@ void PIMRank::controlPIM(BusPacket* packet)
     if (pimOpMode_)
     {
         rank->mode_ = dramMode::HAB_PIM;
-        pimPC_ = 0;
-        lastJumpIdx_ = numJumpToBeTaken_ = lastRepeatIdx_ = numRepeatToBeDone_ = -1;
-        crfExit_ = false;
+        sharedState_ = ExecutionState{};
+        fill(blockStates_.begin(), blockStates_.end(), ExecutionState{});
         resetMacAccounting();
         PRINTC(RED, OUTLOG_CH_RA("HAB_PIM"));
     }
@@ -154,7 +182,7 @@ void PIMRank::controlPIM(BusPacket* packet)
 
 bool PIMRank::isToggleCond(BusPacket* packet)
 {
-    if (pimOpMode_ && !crfExit_)
+    if (pimOpMode_ && !allBlocksExited())
     {
         if (toggleRa13h_)
         {
@@ -361,109 +389,160 @@ void PIMRank::writeOpd(int pb, BurstType& bst, PIMOpdType type, BusPacket* packe
 
 void PIMRank::doPIM(BusPacket* packet)
 {
-    PIMCmd cCmd;
+    vector<unsigned> blocks(pimBlocks.size());
+    iota(blocks.begin(), blocks.end(), 0);
+    if (selectiveProgressEnabled_)
+        doPIMSelected(packet, blocks);
+    else
+        executePIM(packet, sharedState_, blocks);
+}
+
+void PIMRank::doPIMSelected(BusPacket* packet, const vector<unsigned>& blocks)
+{
+    if (!selectiveProgressEnabled_ || !pimOpMode_)
+        throw logic_error("Selective progress requires enabling it and entering PIM mode");
+    if (packet == nullptr || (packet->busPacketType != READ && packet->busPacketType != WRITE))
+        throw invalid_argument("Selective progress requires a READ or WRITE packet");
+
+    // Validate the entire selection before any block or packet data changes.
+    vector<bool> seen(pimBlocks.size(), false);
+    for (unsigned pb : blocks)
+    {
+        if (pb >= pimBlocks.size()) throw out_of_range("Selected PIM block is out of range");
+        if (seen[pb]) throw invalid_argument("Selected PIM blocks must be unique");
+        seen[pb] = true;
+    }
+
+    // Operand reads/stores use packet->data as scratch. Give each block the
+    // original request data so one block cannot feed its scratch into another.
+    const BurstType requestData = packet->data ? *packet->data : BurstType{};
+    for (unsigned pb : blocks)
+    {
+        if (blockStates_[pb].exited) continue;
+        BurstType localData = requestData;
+        BusPacket localPacket = *packet;
+        localPacket.data = &localData;
+        executePIM(&localPacket, blockStates_[pb], vector<unsigned>{pb});
+        if (packet->data) *packet->data = localData;
+    }
+}
+
+void PIMRank::executePIM(BusPacket* packet, ExecutionState& state, const vector<unsigned>& blocks)
+{
+    if (state.exited) return;
     packet->row = masked2accessibleRA(packet->row);
+    const auto fetch = [this](int pc)
+    {
+        if (pc < 0 || static_cast<unsigned>(pc) >= sizeof(crf.data) / sizeof(crf.data[0]))
+            throw out_of_range("PIM program counter is outside the CRF");
+        PIMCmd command;
+        command.fromInt(crf.data[pc]);
+        return command;
+    };
+
+    PIMCmd cCmd;
     do
     {
-        cCmd.fromInt(crf.data[pimPC_]);
+        cCmd = fetch(state.pc);
         if (DEBUG_CMD_TRACE)
         {
             PRINTC(CYAN, string((packet->busPacketType == READ) ? "READ ch" : "WRITE ch")
                              << getChanId() << " ra" << getRankId() << " bg"
                              << config.addrMapping.bankgroupId(packet->bank) << " b" << packet->bank
-                             << " r" << packet->row << " c" << packet->column << "|| [" << pimPC_
-                             << "] " << cCmd.toStr() << " @ " << currentClockCycle);
+                             << " r" << packet->row << " c" << packet->column << "|| [" << state.pc
+                             << "] " << cCmd.toStr() << " pb["
+                             << (blocks.size() == 1 ? to_string(blocks.front()) : "all")
+                             << "] @ " << currentClockCycle);
         }
 
         if (cCmd.type_ == PIMCmdType::EXIT)
         {
-            crfExit_ = true;
+            state.exited = true;
             break;
         }
         else if (cCmd.type_ == PIMCmdType::JUMP)
         {
-            if (lastJumpIdx_ != pimPC_)
+            if (state.lastJumpIdx != state.pc)
             {
                 if (cCmd.loopCounter_ > 0)
                 {
-                    lastJumpIdx_ = pimPC_;
-                    numJumpToBeTaken_ = cCmd.loopCounter_;
+                    state.lastJumpIdx = state.pc;
+                    state.remainingJumps = cCmd.loopCounter_;
                 }
             }
-            if (numJumpToBeTaken_ > 0)
+            if (state.remainingJumps > 0)
             {
-                pimPC_ -= cCmd.loopOffset_;
-                numJumpToBeTaken_--;
+                state.pc -= cCmd.loopOffset_;
+                state.remainingJumps--;
             }
         }
         else
         {
             if (cCmd.type_ == PIMCmdType::FILL || cCmd.isAuto_)
             {
-                if (lastRepeatIdx_ != pimPC_)
+                if (state.lastRepeatIdx != state.pc)
                 {
-                    lastRepeatIdx_ = pimPC_;
-                    numRepeatToBeDone_ = 8 - 1;
+                    state.lastRepeatIdx = state.pc;
+                    state.remainingRepeats = 8 - 1;
                 }
 
-                if (numRepeatToBeDone_ > 0)
+                if (state.remainingRepeats > 0)
                 {
-                    pimPC_ -= 1;
-                    numRepeatToBeDone_--;
+                    state.pc -= 1;
+                    state.remainingRepeats--;
                 }
                 else
-                    lastRepeatIdx_ = -1;
+                    state.lastRepeatIdx = -1;
             }
             else if (cCmd.type_ == PIMCmdType::NOP)
             {
-                if (lastRepeatIdx_ != pimPC_)
+                if (state.lastRepeatIdx != state.pc)
                 {
-                    lastRepeatIdx_ = pimPC_;
-                    numRepeatToBeDone_ = cCmd.loopCounter_;
+                    state.lastRepeatIdx = state.pc;
+                    state.remainingRepeats = cCmd.loopCounter_;
                 }
 
-                if (numRepeatToBeDone_ > 0)
+                if (state.remainingRepeats > 0)
                 {
-                    pimPC_ -= 1;
-                    numRepeatToBeDone_--;
+                    state.pc -= 1;
+                    state.remainingRepeats--;
                 }
                 else
-                    lastRepeatIdx_ = -1;
+                    state.lastRepeatIdx = -1;
             }
 
-            const bool isMac = cCmd.type_ == PIMCmdType::MAC;
-            for (int pimblock_id = 0; pimblock_id < config.NUM_PIM_BLOCKS; pimblock_id++)
-            {
-                if (isMac && completionMaskEnabled_ && remainingMacs_[pimblock_id] == 0)
-                {
-                    ++skippedMacs_[pimblock_id];
-                    continue;
-                }
-
-                doPIMBlock(packet, cCmd, pimblock_id);
-
-                if (isMac)
-                {
-                    ++executedMacs_[pimblock_id];
-                    if (completionMaskEnabled_) --remainingMacs_[pimblock_id];
-                }
-
-                if (DEBUG_PIM_BLOCK && pimblock_id == 0)
-                {
-                    PRINT("[BANK_R]" << packet->data->fp16ToStr());
-                    PRINT("[CMD]" << bitset<32>(cCmd.toInt()) << "(" << cCmd.toStr() << ")");
-                    PRINT(pimBlocks[pimblock_id].print());
-                    PRINT("----------");
-                }
-            }
+            for (unsigned pb : blocks) executeBlockInstruction(packet, cCmd, pb);
         }
-        pimPC_++;
-        // EXIT check
-        PIMCmd next_cmd;
-        next_cmd.fromInt(crf.data[pimPC_]);
-        if (next_cmd.type_ == PIMCmdType::EXIT)
-            crfExit_ = true;
-    } while (cCmd.type_ == PIMCmdType::JUMP);
+        state.pc++;
+        // EXIT is observed before the next trigger, after any pending store.
+        if (fetch(state.pc).type_ == PIMCmdType::EXIT) state.exited = true;
+    } while (cCmd.type_ == PIMCmdType::JUMP && !state.exited);
+}
+
+void PIMRank::executeBlockInstruction(BusPacket* packet, const PIMCmd& command, unsigned pb)
+{
+    const bool isMac = command.type_ == PIMCmdType::MAC;
+    if (isMac && completionMaskEnabled_ && remainingMacs_[pb] == 0)
+    {
+        ++skippedMacs_[pb];
+        return;
+    }
+
+    doPIMBlock(packet, command, pb);
+
+    if (isMac)
+    {
+        ++executedMacs_[pb];
+        if (completionMaskEnabled_) --remainingMacs_[pb];
+    }
+
+    if (DEBUG_PIM_BLOCK && pb == 0)
+    {
+        PRINT("[BANK_R]" << packet->data->fp16ToStr());
+        PRINT("[CMD]" << bitset<32>(command.toInt()) << "(" << command.toStr() << ")");
+        PRINT(pimBlocks[pb].print());
+        PRINT("----------");
+    }
 }
 
 void PIMRank::doPIMBlock(BusPacket* packet, PIMCmd cCmd, int pimblock_id)

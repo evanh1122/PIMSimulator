@@ -64,8 +64,23 @@ class PIMRank : public SimulatorObject
     int rankId;
     ostream& dramsimLog;
     Configuration& config;
-    int pimPC_, lastJumpIdx_, numJumpToBeTaken_, lastRepeatIdx_, numRepeatToBeDone_;
-    bool pimOpMode_, toggleEvenBank_, toggleOddBank_, toggleRa13h_, crfExit_;
+    struct ExecutionState
+    {
+        int pc = 0;
+        int lastJumpIdx = -1;
+        int remainingJumps = -1;
+        int lastRepeatIdx = -1;
+        int remainingRepeats = -1;
+        bool exited = false;
+    };
+
+    ExecutionState sharedState_;
+    bool selectiveProgressEnabled_ = false;
+    vector<ExecutionState> blockStates_;
+    bool pimOpMode_, toggleEvenBank_, toggleOddBank_, toggleRa13h_;
+
+    void executePIM(BusPacket* packet, ExecutionState& state, const vector<unsigned>& blocks);
+    void executeBlockInstruction(BusPacket* packet, const PIMCmd& command, unsigned pb);
 
     // Budgets count a prefix of vector MAC executions, including internal zeros.
     // Completion gates only MACs; shared control and result stores still execute.
@@ -100,6 +115,14 @@ class PIMRank : public SimulatorObject
     void disableCompletionMask();
     uint64_t getExecutedMacs(unsigned pb) const;
     uint64_t getSkippedMacs(unsigned pb) const;
+
+    // Functional selection API. All selected blocks use the packet's address;
+    // callers must load matching operands. Selection transfer timing is not modeled.
+    void enableSelectiveProgress();
+    void doPIMSelected(BusPacket* packet, const vector<unsigned>& blocks);
+    unsigned getBlockPC(unsigned pb) const;
+    bool isBlockExited(unsigned pb) const;
+    bool allBlocksExited() const;
 
     union crf_t
     {
